@@ -43,6 +43,7 @@ grp+div: grouping with divisive normalization;
 |                                 |          | grp+div |   grp  | grp+div |    grp   | grp+div |
 | 1x wide net                     |   91.0   |   91.0  |  88.8  |   89.8  |    -*   |   86.2  |
 | 2x wide net                     |   91.9   |   90.9  |  89.4  |   91.3  |    -*   |   90.4  |
+
 \* we couldn't find parameters for the Gaussian kernel with grouping that achieve above 40%
 #### VGG-like network trained with AdamW + batchnorm:
 `./experiments_scripts/run_vgg_adam_experiments_grid.sh`
