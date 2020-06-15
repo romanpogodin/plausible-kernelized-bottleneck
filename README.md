@@ -1,4 +1,5 @@
-# Kernelized information bottleneck leads to biologically plausible 3-factor Hebbian learning in deep networks
+# Plausible kernelized bottleneck
+Implementation of "Kernelized information bottleneck leads to biologically plausible 3-factor Hebbian learning in deep networks" by R. Pogodin and P. E. Latham (https://arxiv.org/abs/2006.07123)
 
 ### Experiments
 Scripts with reported experiments are stored in `./experiments_scripts/`.
