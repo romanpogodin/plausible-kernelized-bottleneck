@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
 import losses
+import alt_feedback_layers
 
 
 def get_task_dimensions(task):
@@ -84,8 +85,7 @@ class Layer(nn.Module):
         self.local_loss_value = None
         self.local_opt = None
         self.local_opt_scheduler = None
-        self.pre_activation = None
-        self.post_activation = None
+        self.activation = None
         self.pooling = None
         self.dropout = None
         self.batch_norm = None
@@ -164,7 +164,7 @@ class LinearLayer(Layer):
     """
     def __init__(self, num_in, num_out, nonlinearity, local_loss=None, local_opt=None, local_opt_scheduler=None,
                  bias=False, opt_arguments_dict=None, scheduler_arguments_dict=None, dropout_p=0.0, batch_norm=False,
-                 divisive_norm=None):
+                 divisive_norm=None, alt_feedback_type=None):
         """
         :param num_in:                      int, input dimensionality
         :param num_out:                     int, number of neurons in the layer
@@ -180,10 +180,14 @@ class LinearLayer(Layer):
         :param dropout_p:                   float, dropout probability
         :param batch_norm:                  bool, whether to apply batchnorm or not
         :param divisive_norm:               DivisiveNorm or None, divisive normalization
+        :param alt_feedback_type:           str or None, pass 'feedback_alignment' or 'sign_symmetry' for those layers
         """
         super().__init__()
 
-        self.layer = nn.Linear(num_in, num_out, bias=bias)
+        if alt_feedback_type is None:
+            self.layer = nn.Linear(num_in, num_out, bias=bias)
+        else:
+            self.layer = alt_feedback_layers.AltBackwardLinear(num_in, num_out, bias, alt_feedback_type)
         self.nonlinearity = nonlinearity
 
         self.local_loss = local_loss
@@ -238,7 +242,7 @@ class ConvLayer(Layer):
     def __init__(self, in_channels, out_channels, kernel_size, nonlinearity, pooling=None, local_loss=None,
                  local_opt=None, local_opt_scheduler=None, bias=False, opt_arguments_dict=None,
                  scheduler_arguments_dict=None, dropout_p=0.0, batch_norm=False, divisive_norm=None,
-                 spatial_dropout=False):
+                 spatial_dropout=False, alt_feedback_type=None):
         """
         :param in_channels:                 int, number of channels in the input
         :param out_channels:                int, number of channels in the layer
@@ -258,10 +262,16 @@ class ConvLayer(Layer):
         :param divisive_norm:               DivisiveNorm or None, divisive normalization
         :param spatial_dropout:             bool, whether to use spatial dropout (which drops out whole channels)
             or the standard dropout
+        :param alt_feedback_type:           str or None, pass 'feedback_alignment' or 'sign_symmetry' for those layers
         """
         super().__init__()
 
-        self.layer = nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2, bias=bias)
+        if alt_feedback_type is None:
+            self.layer = nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2, bias=bias)
+        else:
+            self.layer = alt_feedback_layers.AltBackwardConv2d(in_channels, out_channels, kernel_size,
+                                                               padding=(kernel_size - 1) // 2, bias=bias,
+                                                               backward_type=alt_feedback_type)
         self.nonlinearity = nonlinearity
 
         self.local_loss = local_loss
@@ -309,16 +319,17 @@ def get_divisive_norm(ind, divisive_norm_list):
 
 
 class Network(nn.Module):
-    def __init__(self, nonlinearity, local_loss, local_opt, local_opt_scheduler, conv_channels_sizes,
+    def __init__(self, nonlinearity, local_loss_list, local_opt, local_opt_scheduler, conv_channels_sizes,
                  conv_kernels_sizes, do_pooling_by_layer, fc_layers_sizes, pooling_type='max', task='MNIST', bias=False,
                  local_opt_arguments_dict=None,  local_scheduler_arguments_dict=None, dropout_p=0.0, batch_norm=False,
-                 divisive_norm_list_conv=None, spatial_dropout=False, divisive_norm_list_fc=None):
+                 divisive_norm_list_conv=None, spatial_dropout=False, divisive_norm_list_fc=None,
+                 alt_feedback_type=None):
         """
         A network with convolutional layers followed by fully connected layers.
         :param nonlinearity:                    nn.Module, forward(x) applies an element-wise function to torch.Tensor x
             if nn.SELU, dropout becomes nn.AlphaDropout
             (or nn.FeatureAlphaDropout if spatial_dropout == True and the layer is conv)
-        :param local_loss:                      nn.Module with forward(self, z, y) that returns float
+        :param local_loss_list:                 list of nn.Module with forward(self, z, y) that returns float
         :param local_opt:                       torch.optim.Optimizer, optimizer to apply on local_loss
         :param local_opt_scheduler:             torch.optim.lr_scheduler._LRScheduler,
             learning rate scheduler for the optimizer
@@ -338,6 +349,7 @@ class Network(nn.Module):
         :param spatial_dropout:                 bool, whether to use spatial dropout (which drops out whole channels)
             or the standard dropout in convolutional layers
         :param divisive_norm_list_fc:           list of DivisiveNormalization or None, div norm for fc layers
+        :param alt_feedback_type:           str or None, pass 'feedback_alignment' or 'sign_symmetry' for those layers
         """
         super().__init__()
 
@@ -346,11 +358,11 @@ class Network(nn.Module):
 
         for ind, channel_size in enumerate(conv_channels_sizes):
             layers.append(ConvLayer(in_channels, channel_size, conv_kernels_sizes[ind], nonlinearity,
-                                    (pooling_type if do_pooling_by_layer[ind] else None), local_loss, local_opt,
-                                    local_opt_scheduler, bias, local_opt_arguments_dict,
+                                    (pooling_type if do_pooling_by_layer[ind] else None), local_loss_list[ind],
+                                    local_opt, local_opt_scheduler, bias, local_opt_arguments_dict,
                                     local_scheduler_arguments_dict, dropout_p, batch_norm,
                                     divisive_norm=get_divisive_norm(ind, divisive_norm_list_conv),
-                                    spatial_dropout=spatial_dropout))
+                                    spatial_dropout=spatial_dropout, alt_feedback_type=alt_feedback_type))
             in_channels = channel_size
             if do_pooling_by_layer[ind]:  # pooling always pools by 2 here
                 input_size = input_size // 4
@@ -358,15 +370,23 @@ class Network(nn.Module):
         in_neurons = in_channels * input_size
 
         for ind, layer_size in enumerate(fc_layers_sizes):
-            layers.append(LinearLayer(in_neurons, layer_size, nonlinearity, local_loss, local_opt, local_opt_scheduler,
+            layers.append(LinearLayer(in_neurons, layer_size, nonlinearity,
+                                      local_loss_list[ind + len(conv_channels_sizes)],
+                                      local_opt, local_opt_scheduler,
                                       bias, local_opt_arguments_dict, local_scheduler_arguments_dict,
                                       dropout_p, batch_norm,
-                                      divisive_norm=get_divisive_norm(ind, divisive_norm_list_fc)))
+                                      divisive_norm=get_divisive_norm(ind, divisive_norm_list_fc),
+                                      alt_feedback_type=alt_feedback_type))
             in_neurons = layer_size
 
         self.n_classes = n_classes
         self.hidden_layers = SequentialWithLocalLoss(*layers)
-        self.softmax_layer = nn.Linear(in_neurons, self.n_classes, bias=True)
+
+        if alt_feedback_type is None:
+            self.softmax_layer = nn.Linear(in_neurons, self.n_classes, bias=True)
+        else:
+            self.softmax_layer = alt_feedback_layers.AltBackwardLinear(in_neurons, self.n_classes,
+                                                                       bias=True, backward_type=alt_feedback_type)
 
         for m in self.modules():
             if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d):

@@ -17,7 +17,7 @@ def run_mlp_experiment(args, device):
 
     train_loader, validation_loader, test_loader = datasets.build_loaders_by_dataset(
         args.dataset, args.batch_size, validation_ratio=validation_ratio, train_validation_split_seed=0)
-    local_loss = utils.get_loss(args)
+    local_loss_list = utils.get_loss(args)
     nonlinearity = utils.get_nonlinearity(args)
 
     optimizer_local, local_opt_arguments_dict, local_scheduler_arguments_dict, \
@@ -37,14 +37,20 @@ def run_mlp_experiment(args, device):
     else:
         divisive_norm_list = None
 
-    net = networks.Network(nonlinearity, local_loss, optimizer_local,
+    alt_feedback_type = None
+    if args.feedback_alignment:
+        alt_feedback_type = 'feedback_alignment'
+    elif args.sign_symmetry:
+        alt_feedback_type = 'sign_symmetry'
+
+    net = networks.Network(nonlinearity, local_loss_list, optimizer_local,
                            torch.optim.lr_scheduler.MultiStepLR, conv_sizes, kernel_sizes,
                            do_pooling, fc_layers, 'max', args.dataset, bias=False,
                            local_opt_arguments_dict=local_opt_arguments_dict,
                            local_scheduler_arguments_dict=local_scheduler_arguments_dict,
                            dropout_p=args.dropout_p, batch_norm=args.batch_norm,
                            divisive_norm_list_conv=None, divisive_norm_list_fc=divisive_norm_list,
-                           spatial_dropout=args.spatial_dropout)
+                           spatial_dropout=args.spatial_dropout, alt_feedback_type=alt_feedback_type)
 
     net = net.to(device)
     print(net)
@@ -66,7 +72,7 @@ def run_mlp_experiment(args, device):
         net, device, final_loss, final_opt, final_scheduler, args.n_epochs, train_loader, validation_loader,
         test_loader, compute_local_loss=compute_local_loss, update_local_loss=update_local_loss,
         record_train_acc=record_train_acc, record_val_acc=record_val_acc, record_test_acc=record_test_acc,
-        print_results=True)
+        print_results=True, backprop_batch_manhattan=args.backprop_batch_manhattan)
 
     return train_acc, val_acc, test_acc
 
@@ -83,7 +89,7 @@ def run_vgg_experiment(args, device):
     train_loader, validation_loader, test_loader = datasets.build_cifar10_loaders(args.batch_size,
                                                                                   validation_ratio=validation_ratio,
                                                                                   train_validation_split_seed=0)
-    local_loss = utils.get_loss(args)
+    local_loss_list = utils.get_loss(args)
     nonlinearity = utils.get_nonlinearity(args)
 
     optimizer_local, local_opt_arguments_dict, local_scheduler_arguments_dict, \
@@ -113,14 +119,20 @@ def run_vgg_experiment(args, device):
     else:
         divisive_norm_list_fc = None
 
-    net = networks.Network(nonlinearity, local_loss, optimizer_local,
+    alt_feedback_type = None
+    if args.feedback_alignment:
+        alt_feedback_type = 'feedback_alignment'
+    elif args.sign_symmetry:
+        alt_feedback_type = 'sign_symmetry'
+
+    net = networks.Network(nonlinearity, local_loss_list, optimizer_local,
                            torch.optim.lr_scheduler.MultiStepLR, conv_sizes, kernel_sizes,
                            do_pooling, fc_layers, 'max', 'CIFAR10', bias=False,
                            local_opt_arguments_dict=local_opt_arguments_dict,
                            local_scheduler_arguments_dict=local_scheduler_arguments_dict,
                            dropout_p=args.dropout_p, batch_norm=args.batch_norm,
                            divisive_norm_list_conv=divisive_norm_list_conv, divisive_norm_list_fc=divisive_norm_list_fc,
-                           spatial_dropout=args.spatial_dropout)
+                           spatial_dropout=args.spatial_dropout, alt_feedback_type=alt_feedback_type)
 
     net = net.to(device)
     print(net)
@@ -142,7 +154,7 @@ def run_vgg_experiment(args, device):
         net, device, final_loss, final_opt, final_scheduler, args.n_epochs, train_loader, validation_loader,
         test_loader, compute_local_loss=compute_local_loss, update_local_loss=update_local_loss,
         record_train_acc=record_train_acc, record_val_acc=record_val_acc, record_test_acc=record_test_acc,
-        print_results=True)
+        print_results=True, backprop_batch_manhattan=args.backprop_batch_manhattan)
 
     return train_acc, val_acc, test_acc
 
@@ -160,6 +172,14 @@ def main():
             train_acc, val_acc, test_acc = run_vgg_experiment(args, device)
         else:
             raise NotImplementedError('experiment must be mlp or vgg, but %s was given' % args.experiment)
+
+    print('Final validation accuracy: %f' % val_acc[-1])
+    print('Job finished')
+
+    if args.save_results:
+        np.save(args.results_filename + '_train_acc', train_acc)
+        np.save(args.results_filename + '_val_acc', val_acc)
+        np.save(args.results_filename + '_test_acc', test_acc)
 
 
 if __name__ == '__main__':

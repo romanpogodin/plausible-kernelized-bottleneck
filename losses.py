@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import kernels
+import alt_feedback_layers
 
 
 def center_data(x, dim=-1):
@@ -102,3 +103,58 @@ class HSICzyLoss(nn.Module):
         return kernels.estimate_hsic_zy_objective(self.process_input(z, self.z_processing),
                                                   self.process_input(y, self.y_processing),
                                                   self.z_kernel, self.y_kernel, self.gamma, self.mode)
+
+
+class LocalCrossEntropy(nn.Module):
+    """
+    Loss for layer-wise classification
+    """
+    def __init__(self, projection_size, out_size, is_conv=False, n_channels=None, alt_feedback_type=None):
+        """
+        :param projection_size:   int, final size (after AdaptiveAvgPool2d) for conv layers
+        :param out_size:          int, number of classes
+        :param is_conv:           bool, is the layer convolutional
+        :param n_channels:        int, number of channels in a conv layer
+        :param alt_feedback_type: str or None, type of alternative feedback (feedback_alignment or sign_symmetry)
+        """
+        super().__init__()
+
+        self.projection_size = projection_size
+        self.out_size = out_size
+        self.is_conv = is_conv
+        self.alt_feedback_type = alt_feedback_type
+        projection = list()
+
+        if self.is_conv:
+            pool_width = int(np.sqrt(projection_size // n_channels))
+            pool_height = projection_size // n_channels // pool_width
+            projection.append(nn.AdaptiveAvgPool2d((pool_height, pool_width)))
+            projection.append(nn.Flatten())
+            if projection_size != pool_height * pool_width * n_channels:
+                print('Adaptive projection size from %d to %d' % (projection_size, pool_height * pool_width * n_channels))
+                projection_size = pool_height * pool_width * n_channels
+
+        if alt_feedback_type is None:
+            projection.append(nn.Linear(projection_size, out_size, bias=True))
+        else:
+            projection.append(alt_feedback_layers.AltBackwardLinear(projection_size, out_size,
+                                                                    bias=True, backward_type=alt_feedback_type))
+
+        self.projection = nn.Sequential(*projection)
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
+
+    def extra_repr(self):
+        s = 'projection_size={projection_size}, ' \
+            'out_size={out_size}, ' \
+            'is_conv={is_conv}, ' \
+            'alt_feedback_type={alt_feedback_type}'
+        return s.format(**self.__dict__)
+
+    def forward(self, z, y_onehot):
+        """
+        Forward pass.
+        :param z: torch.Tensor, activations
+        :param y: torch.Tensor, one-hot labels
+        :return: float, cross-entropy
+        """
+        return self.cross_entropy_loss(self.projection(z), torch.argmax(y_onehot, dim=-1))

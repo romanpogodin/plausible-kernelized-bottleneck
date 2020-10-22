@@ -5,6 +5,7 @@ import numpy as np
 import argparse
 import losses
 import kernels
+import networks
 from warnings import warn
 
 
@@ -59,6 +60,11 @@ def parse_arguments(args=None):
                         help='Dataset: CIFAR10, MNIST, kMNIST, fMNIST; default: CIFAR10')
     parser.add_argument("--n-epochs", type=int, default=100, help="Number of epochs; default: 100")
     parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size; default: 128")
+    parser.add_argument("--save-results", action='store_true', help='Save final results; default: False')
+    parser.add_argument("--results-filename", type=str, default='final',
+                        help='Name prefix for saved results; default: final')
+    parser.add_argument("--grid-search-dummy", action='store_true',
+                        help='Does nothing. Useful for store_true arguments in grid search.')
 
     # optimizers
     parser.add_argument('--optimizer-final', type=str, default='SGD',
@@ -75,13 +81,19 @@ def parse_arguments(args=None):
                         help="List of epochs for lr decrease (e.g. --epoch-decrease-lr 100 200); default: [100]")
     parser.add_argument("--opt-lr-decrease", type=float, default=0.25,
                         help='Learning rate multiplier when it decreases; default: 0.25')
-    parser.add_argument("--weight-decay-local", type=float, default=0.0,
+    parser.add_argument("--weight-decay-local", type=float, default=1e-7,
                         help="Weight decay for local optimizers; default: 0.0")
     parser.add_argument("--weight-decay-final", type=float, default=1e-5,
                         help="Weight decay for final layer or backprop; default: 1e-5")
     parser.add_argument("--final-lr", type=float, default=0.005,
                         help="Learning rate for the final layer/backprop; default: 0.005")
     parser.add_argument("--local-lr", type=float, default=0.001, help="Local loss learning rate; default: 0.001")
+    parser.add_argument("--feedback-alignment", action='store_true',
+                        help='Do feedback alignment; ignores local losses; default: False')
+    parser.add_argument("--sign-symmetry", action='store_true',
+                        help='Do sign symmetry; ignores local losses; default: False')
+    parser.add_argument("--backprop-batch-manhattan", action='store_true',
+                        help='Use signs of gradients for backprop-based methods; default: False')
 
     # network parameters
     parser.add_argument('--mlp-layer-size', type=int, default=1024,
@@ -98,6 +110,9 @@ def parse_arguments(args=None):
                         help='Use batch norm; default: False')
 
     # local loss parameters
+    parser.add_argument("--local-loss-type", type=str, default='HSIC',
+                        help='Local loss type. Can be HSIC, cross-entropy or cross-entropy-fa '
+                             '(for feedback alignment); default: HSIC')
     parser.add_argument("--bottleneck-gamma", type=float, default=2.0,
                         help="Bottleneck balance parameter gamma; default: 2.0")
     parser.add_argument("--hsic-kernel-z", type=str, default="cossim",
@@ -110,6 +125,8 @@ def parse_arguments(args=None):
                         help='Sigma for the gaussian kernel on y; default: 5.0')
     parser.add_argument('--hsic-estimate-mode', type=str, default='plausible',
                         help='HSIC estimate: biased or plausible (i.e. pHSIC); default: plausible')
+    parser.add_argument("--local-cross-entropy-projection-size", type=int, default=2048,
+                        help='Inner dimensionality of the local classifier; default: 2048')
 
     # local loss grouping and transformations
     parser.add_argument('--center-local-loss-data', action='store_true', default=False,
@@ -136,6 +153,11 @@ def parse_arguments(args=None):
         args = parser.parse_args()
     else:
         args = parser.parse_args(args)
+
+    if args.feedback_alignment and args.sign_symmetry:
+        raise ValueError('Cannot use both --feedback-alignment and --sign-symmetry.')
+    if args.feedback_alignment or args.sign_symmetry:
+        args.backprop = True
 
     print("Simulation arguments:", args)
 
@@ -200,7 +222,8 @@ def record_and_print_running_statistics(record_train_acc, record_val_acc, record
 
 def train_network(net, device, output_loss, optimizer, scheduler, n_epochs,
                   train_loader, validation_loader, test_loader, compute_local_loss, update_local_loss,
-                  record_train_acc=False, record_val_acc=True, record_test_acc=False, print_results=True):
+                  record_train_acc=False, record_val_acc=True, record_test_acc=False, print_results=True,
+                  backprop_batch_manhattan=False):
     """
     Trains the given network
     :param net:                 nn.Module, network
@@ -219,6 +242,7 @@ def train_network(net, device, output_loss, optimizer, scheduler, n_epochs,
     :param record_val_acc:      bool
     :param record_test_acc:     bool
     :param print_results:       bool, print accuracies if recorded
+    :param backprop_batch_manhattan: bool, use signs of gradients for backprop
     :return: np.array of float, np.array of float, np.array of float; train_acc, val_acc, test_acc (in percentage)
     """
     train_acc = -np.ones(n_epochs + 1)
@@ -243,6 +267,14 @@ def train_network(net, device, output_loss, optimizer, scheduler, n_epochs,
 
             loss_value = output_loss(outputs, labels)
             loss_value.backward()
+
+            if backprop_batch_manhattan:
+                with torch.no_grad():
+                    for group in optimizer.param_groups:
+                        for p in group['params']:
+                            if p.grad is not None:
+                                p.grad = torch.sign(p.grad)
+
             optimizer.step()
 
             if compute_local_loss:
@@ -326,11 +358,45 @@ def get_loss(args):
     :param args: Namespace from parse_arguments
     :return: losses.HSICzyLoss
     """
-    kernel_z, kernel_y = build_kernels(args)
-    z_processing, y_processing = build_processing(args)
+    if args.experiment == 'mlp':
+        n_layers = 3
+    elif args.experiment == 'vgg':
+        n_layers = 7
+    else:
+        raise NotImplementedError('experiment must be mlp or vgg, but %s was given' % args.experiment)
 
-    return losses.HSICzyLoss(kernel_y, kernel_z, gamma=args.bottleneck_gamma, y_processing=y_processing,
-                             z_processing=z_processing, mode=args.hsic_estimate_mode)
+    if args.local_loss_type == 'HSIC':
+        kernel_z, kernel_y = build_kernels(args)
+        z_processing, y_processing = build_processing(args)
+
+        return [losses.HSICzyLoss(kernel_y, kernel_z, gamma=args.bottleneck_gamma, y_processing=y_processing,
+                                  z_processing=z_processing, mode=args.hsic_estimate_mode) for i in range(n_layers)]
+    elif args.local_loss_type == 'cross-entropy' or args.local_loss_type == 'cross-entropy-fa':
+        alt_feedback_type = 'feedback_alignment' if 'fa' in args.local_loss_type else None
+
+        if args.experiment == 'mlp':
+            return [losses.LocalCrossEntropy(args.local_cross_entropy_projection_size,
+                                             out_size=networks.get_task_dimensions(args.dataset)[-1],
+                                             alt_feedback_type=alt_feedback_type) for i in range(n_layers)]
+        else:
+            conv_sizes = [128, 256, 256, 512, 512, 512]
+
+            if args.vgg_conv_size_multiplier != 1:
+                for i in range(len(conv_sizes)):
+                    conv_sizes[i] = conv_sizes[i] * args.vgg_conv_size_multiplier
+
+            losses_list = [losses.LocalCrossEntropy(
+                args.local_cross_entropy_projection_size,
+                out_size=networks.get_task_dimensions(args.dataset)[-1],
+                is_conv=True, n_channels=n_channels, alt_feedback_type=alt_feedback_type)
+                for n_channels in conv_sizes]
+            losses_list.append(losses.LocalCrossEntropy(min(1024, args.local_cross_entropy_projection_size),
+                                                        out_size=networks.get_task_dimensions(args.dataset)[-1],
+                                                        alt_feedback_type=alt_feedback_type))
+            return losses_list
+    else:
+        raise NotImplementedError('--local-loss-type must be HSIC, cross-entropy or cross-entropy-fa, but %s was given'
+                                  % args.local_loss_type)
 
 
 def get_nonlinearity(args):
