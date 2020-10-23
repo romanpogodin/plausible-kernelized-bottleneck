@@ -31,6 +31,7 @@ grp+div: grouping with divisive normalization;
 
 #### VGG-like network:
 `./experiments_scripts/run_vgg_sgd_experiments_grid.sh`
+
 `./experiments_scripts/run_vgg_adam_experiments_grid.sh`
 
 Mean test accuracy on CIFAR10 over 5 runs for a 7-layer conv nets (1x and 2x wide).
